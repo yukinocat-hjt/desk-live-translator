@@ -1,0 +1,10 @@
+PySide6>=6.6.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+dxcam>=0.0.5
+mss>=9.0.0
+rapidocr>=2.0.3
+onnxruntime>=1.17.0
+httpx>=0.27.0
+pynput>=1.7.6
+Pillow>=10.0.0
