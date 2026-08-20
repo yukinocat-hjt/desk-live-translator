@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from PySide6.QtCore import QRect
-from PySide6.QtGui import QGuiApplication
+
+from app.capture.dpi import qrect_to_physical
+
+__all__ = ["ScreenCapturer", "qrect_to_physical"]
 
 
 class ScreenCapturer:
@@ -99,18 +101,6 @@ class ScreenCapturer:
         if bgra.ndim != 3:
             return None
         return np.ascontiguousarray(bgra[:, :, :3])
-
-
-def qrect_to_physical(rect: QRect) -> tuple[int, int, int, int]:
-    """Map a Qt global rect to physical pixels used by DXGI / mss."""
-    screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
-    dpr = float(screen.devicePixelRatio()) if screen is not None else 1.0
-    geo = screen.geometry() if screen is not None else rect
-    left = round(geo.x() * dpr + (rect.x() - geo.x()) * dpr)
-    top = round(geo.y() * dpr + (rect.y() - geo.y()) * dpr)
-    width = max(2, round(rect.width() * dpr))
-    height = max(2, round(rect.height() * dpr))
-    return left, top, width, height
 
 
 def _monitor_origin(sct: Any, index: int) -> tuple[int, int]:

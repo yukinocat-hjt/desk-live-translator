@@ -1,23 +1,39 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, Qt, QTimer
-from PySide6.QtGui import QCloseEvent
+from pathlib import Path
+
+from PySide6.QtCore import QPointF, QRect, QSize, Qt, QTimer
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QPainter, QPen, QPixmap, QPolygonF, QShowEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
     QMessageBox,
+    QProxyStyle,
     QPushButton,
     QSlider,
+    QStyle,
+    QStyleFactory,
     QVBoxLayout,
     QWidget,
 )
 
 from app.capture.region import RegionSelector
+from app.capture.window_bind import (
+    WindowPicker,
+    client_qrect,
+    exe_key,
+    find_window_for_exe,
+    region_to_rel,
+    rel_to_region,
+    resolve_bound_window,
+)
 from app.config import AppConfig
 from app.pipeline import Pipeline
 from app.translate.base import LANG_LABELS
@@ -60,19 +76,73 @@ QLineEdit, QComboBox {
     padding: 6px 8px;
     min-height: 28px;
 }
-QLineEdit:focus, QComboBox:focus {
+QComboBox {
+    padding: 6px 32px 6px 12px;
+}
+QLineEdit:focus {
     border: 1px solid #f5b84c;
+}
+QComboBox:hover, QComboBox:focus, QComboBox:on {
+    border: 1px solid #d5dae3;
+    background: #ffffff;
 }
 QLineEdit:disabled, QComboBox:disabled {
     background: #f0f2f5;
     color: #9aa1ad;
 }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 28px;
+    border: none;
+    background: transparent;
+}
+QComboBox::down-arrow {
+    image: url("__ARROW__");
+    width: 12px;
+    height: 12px;
+}
+QComboBox:hover::down-arrow, QComboBox:on::down-arrow {
+    image: url("__ARROW_ON__");
+}
+QComboBoxPrivateContainer {
+    background: transparent;
+    border: none;
+    margin: 0;
+    padding: 0;
+}
+QComboBoxPrivateScroller {
+    max-height: 0;
+    border: none;
+    background: transparent;
+}
 QComboBox QAbstractItemView {
     background: #ffffff;
     color: #1c212b;
-    selection-background-color: #fff3d6;
-    selection-color: #1c212b;
-    border: 1px solid #e4e7ec;
+    border: none;
+    border-radius: 10px;
+    outline: 0;
+    padding: 6px;
+}
+QComboBox QAbstractItemView::item {
+    min-height: 32px;
+    padding: 6px 12px;
+    border: none;
+    border-radius: 8px;
+    color: #1c212b;
+}
+QComboBox QAbstractItemView QScrollBar:horizontal {
+    height: 0px;
+    border: none;
+    background: transparent;
+}
+QComboBox QAbstractItemView::item:hover {
+    background: #fff8ea;
+    color: #141820;
+}
+QComboBox QAbstractItemView::item:selected {
+    background: #f5b84c;
+    color: #16120a;
 }
 QSlider::groove:horizontal {
     height: 6px;
@@ -136,33 +206,44 @@ class ControlPanel(QWidget):
         super().__init__()
         self.setObjectName("Root")
         self.setWindowTitle("桌面实时翻译")
-        self.setStyleSheet(STYLESHEET)
-        self.setMinimumWidth(430)
+        self.setStyleSheet(
+            STYLESHEET.replace("__ARROW__", _qss_url(_chevron_png("#5c5c5c", "chevron_down.png")))
+            .replace("__ARROW_ON__", _qss_url(_chevron_png("#1a1a1a", "chevron_down_on.png")))
+        )
+        self.setMinimumWidth(520)
         self._config = config
         self._region = QRect()
         self._quitting = False
         self._running = False
+        self._applying_bind = False
+        self._bound_hwnd = 0
+        self._saved_geometry: QRect | None = None
 
         self.overlay = OverlayWindow()
         self.frame = RegionFrame()
         self.selector = RegionSelector()
+        self.window_picker = WindowPicker()
         self.pipeline = Pipeline()
         self._region_apply_timer = QTimer(self)
         self._region_apply_timer.setSingleShot(True)
         self._region_apply_timer.timeout.connect(self._apply_region_to_pipeline)
+        self._bind_timer = QTimer(self)
+        self._bind_timer.setInterval(250)
+        self._bind_timer.timeout.connect(self._follow_bound_window)
         self.pipeline.result_ready.connect(self._on_result)
         self.pipeline.status_changed.connect(self._on_status)
         self.pipeline.finished.connect(self._on_pipeline_finished)
         self.selector.selected.connect(self._on_region_selected)
         self.selector.cancelled.connect(self._on_select_cancelled)
+        self.window_picker.picked.connect(self._on_window_picked)
+        self.window_picker.cancelled.connect(self._on_window_pick_cancelled)
         self.frame.region_changed.connect(self._on_region_resized)
 
         self._build_ui()
         self._load_fields()
         self.overlay.set_font_size(self._config.font_size)
-        self.overlay.set_show_original(self._config.show_original)
-        self.overlay.set_opacity(self._config.overlay_opacity)
         self.overlay.set_click_through(self._config.click_through)
+        self._bind_timer.start()
 
     def toggle_run(self) -> None:
         if self._running:
@@ -179,10 +260,145 @@ class ControlPanel(QWidget):
     def start_region_select(self) -> None:
         if self._running:
             self.stop()
+        self._panel_was_visible = self.isVisible()
         self.overlay.hide()
         self.frame.hide()
-        QTimer.singleShot(120, self.selector.start)
+        self._remember_geometry()
+        self.window_picker.close()
+        self.hide()
+        QTimer.singleShot(160, self.selector.start)
         self._set_status("拖拽框选翻译区域")
+
+    def _restore_panel_after_select(self) -> None:
+        if not getattr(self, "_panel_was_visible", True):
+            return
+        self.showNormal()
+        self._restore_geometry()
+        self.raise_()
+        self.activateWindow()
+
+    def start_window_pick(self) -> None:
+        self._panel_was_visible = self.isVisible()
+        self.selector.close()
+        self.overlay.hide()
+        self.frame.hide()
+        self._remember_geometry()
+        self.hide()
+        QTimer.singleShot(160, self.window_picker.start)
+        self._set_status("点击要绑定的窗口")
+
+    def _on_window_picked(self, hwnd: int, path: str) -> None:
+        self._restore_panel_after_select()
+        self._apply_bind(path, hwnd)
+        if self._region.width() >= 8:
+            self.frame.set_region(self._region)
+            self.overlay.show()
+        name = exe_key(path) or path
+        self._set_status(f"已绑定 {name}，识别框跟随该窗口，并只截该窗口画面")
+
+    def _on_window_pick_cancelled(self) -> None:
+        self._restore_panel_after_select()
+        if self._region.width() >= 8:
+            self.frame.set_region(self._region)
+            self.overlay.show()
+        self._set_status("已取消绑定窗口")
+
+    def _bind_exe_file(self) -> None:
+        path, _checked = QFileDialog.getOpenFileName(
+            self, "选择要绑定的程序", "", "程序 (*.exe)"
+        )
+        if not path:
+            return
+        found = find_window_for_exe(path)
+        hwnd = found[0] if found else 0
+        self._apply_bind(path, hwnd)
+        name = exe_key(path) or path
+        if hwnd:
+            self._set_status(f"已绑定 {name}，识别框跟随该窗口，并只截该窗口画面")
+        else:
+            self._set_status(f"已绑定 {name}，程序运行后会自动跟随并只截该窗口")
+
+    def _apply_bind(self, path: str, hwnd: int) -> None:
+        self._config.bound_exe = path
+        self._bound_hwnd = int(hwnd or 0)
+        client = client_qrect(hwnd) if hwnd else None
+        if client is None:
+            found = resolve_bound_window(path, self._bound_hwnd)
+            if found is not None:
+                self._bound_hwnd, client = found
+        if client is not None and self._region.width() >= 8:
+            self._config.bound_rel = region_to_rel(self._region, client)
+        self._config.save()
+        self._refresh_bind_label()
+
+    def _clear_bind(self) -> None:
+        self._config.bound_exe = ""
+        self._config.bound_rel = []
+        self._bound_hwnd = 0
+        self._config.save()
+        self._refresh_bind_label()
+        self._set_status("已取消绑定，识别区改回屏幕固定位置")
+
+    def _sync_bound_rel_from_region(self) -> None:
+        if not self._config.bound_exe or self._region.width() < 8:
+            return
+        found = resolve_bound_window(self._config.bound_exe, self._bound_hwnd)
+        if found is None:
+            return
+        self._bound_hwnd, client = found
+        self._config.bound_rel = region_to_rel(self._region, client)
+        self._config.save()
+
+    def _follow_bound_window(self) -> None:
+        if not self._config.bound_exe:
+            self._refresh_bind_label(running=None)
+            return
+        if self.frame.is_dragging():
+            return
+        found = resolve_bound_window(self._config.bound_exe, self._bound_hwnd)
+        self._refresh_bind_label(running=found is not None)
+        if found is None:
+            self._bound_hwnd = 0
+            return
+        self._bound_hwnd, client = found
+        if len(self._config.bound_rel) != 4:
+            if self._region.width() >= 8:
+                self._config.bound_rel = region_to_rel(self._region, client)
+                self._config.save()
+            return
+        new_rect = rel_to_region(self._config.bound_rel, client)
+        if new_rect.width() < 8 or new_rect.height() < 8:
+            return
+        if (
+            abs(new_rect.x() - self._region.x()) < 2
+            and abs(new_rect.y() - self._region.y()) < 2
+            and abs(new_rect.width() - self._region.width()) < 2
+            and abs(new_rect.height() - self._region.height()) < 2
+        ):
+            if self._running:
+                self.pipeline.set_capture_hwnd(self._bound_hwnd)
+            return
+        self._applying_bind = True
+        self._set_region(new_rect, apply_pipeline=self._running, snap_overlay=False)
+        if self._region.width() >= 8:
+            self.frame.set_region(new_rect)
+        self._applying_bind = False
+
+    def _refresh_bind_label(self, running: bool | None = None) -> None:
+        path = self._config.bound_exe
+        if not hasattr(self, "bind_label"):
+            return
+        if not path:
+            self.bind_label.setText("未绑定")
+            self.bind_clear_btn.setEnabled(False)
+            return
+        self.bind_clear_btn.setEnabled(True)
+        name = exe_key(path) or path
+        if running is None:
+            running = resolve_bound_window(path, self._bound_hwnd) is not None
+        state = "跟随中 · 仅该窗口" if running else "未运行"
+        self.bind_label.setText(f"{name} · {state}")
+        self.bind_label.setToolTip(path)
 
     def start(self) -> None:
         self._collect_fields()
@@ -193,7 +409,7 @@ class ControlPanel(QWidget):
         if self.pipeline.isRunning():
             self.pipeline.stop()
             self.pipeline.wait(2000)
-        self.pipeline.configure(self._region, self._config)
+        self.pipeline.configure(self._region, self._config, self._bound_hwnd)
         self.pipeline.start()
         self._running = True
         self.start_btn.setEnabled(False)
@@ -222,6 +438,7 @@ class ControlPanel(QWidget):
         self.overlay.close()
         self.frame.close()
         self.selector.close()
+        self.window_picker.close()
         self._config.save()
         from PySide6.QtWidgets import QApplication
 
@@ -232,7 +449,40 @@ class ControlPanel(QWidget):
             event.accept()
             return
         event.ignore()
+        self._remember_geometry()
         self.hide()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if self._saved_geometry is not None:
+            QTimer.singleShot(0, self._restore_geometry)
+
+    def show_from_tray(self) -> None:
+        self.showNormal()
+        self._restore_geometry()
+        self.raise_()
+        self.activateWindow()
+
+    def _remember_geometry(self) -> None:
+        if not self.isVisible():
+            return
+        geo = self.normalGeometry() if self.isMaximized() else self.geometry()
+        if geo.width() > 80 and geo.height() > 80:
+            self._saved_geometry = QRect(geo)
+
+    def _windowed_size(self) -> QSize:
+        hint = self.sizeHint()
+        width = max(self.minimumWidth(), min(hint.width(), 540))
+        height = max(520, min(int(hint.height() * 0.88), 680))
+        return QSize(width, height)
+
+    def _restore_geometry(self) -> None:
+        size = self._windowed_size()
+        saved = self._saved_geometry
+        x = saved.x() if saved is not None else self.x()
+        y = saved.y() if saved is not None else self.y()
+        self.setWindowState(Qt.WindowState.WindowNoState)
+        self.setGeometry(x, y, size.width(), size.height())
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -268,6 +518,23 @@ class ControlPanel(QWidget):
         region_row.addWidget(self.region_btn)
         form.addRow("识别区域", region_row)
 
+        bind_row = QHBoxLayout()
+        self.bind_label = QLabel("未绑定")
+        self.bind_pick_btn = QPushButton("点选窗口")
+        self.bind_pick_btn.setObjectName("Ghost")
+        self.bind_pick_btn.clicked.connect(self.start_window_pick)
+        self.bind_file_btn = QPushButton("选择程序")
+        self.bind_file_btn.setObjectName("Ghost")
+        self.bind_file_btn.clicked.connect(self._bind_exe_file)
+        self.bind_clear_btn = QPushButton("取消绑定")
+        self.bind_clear_btn.setObjectName("Ghost")
+        self.bind_clear_btn.clicked.connect(self._clear_bind)
+        bind_row.addWidget(self.bind_label, 1)
+        bind_row.addWidget(self.bind_pick_btn)
+        bind_row.addWidget(self.bind_file_btn)
+        bind_row.addWidget(self.bind_clear_btn)
+        form.addRow("绑定程序", bind_row)
+
         lang_row = QHBoxLayout()
         self.src_combo = QComboBox()
         self.dest_combo = QComboBox()
@@ -288,6 +555,8 @@ class ControlPanel(QWidget):
         self.engine_combo.addItem("仅识别不翻译", "none")
         self.engine_combo.currentIndexChanged.connect(self._sync_key_fields)
         form.addRow("翻译引擎", self.engine_combo)
+        for combo in (self.src_combo, self.dest_combo, self.engine_combo):
+            _style_combo(combo)
 
         self.youdao_key_row, self.youdao_key = _secret_input("有道 App Key")
         self.youdao_secret_row, self.youdao_secret = _secret_input("有道 App Secret")
@@ -296,7 +565,7 @@ class ControlPanel(QWidget):
         form.addRow("有道 Secret", self.youdao_secret_row)
         form.addRow("DeepL Key", self.deepl_key_row)
 
-        self.interval_slider, self.interval_value = _slider_row(100, 1500, 50)
+        self.interval_slider, self.interval_value = _slider_row(30, 1500, 10)
         form.addRow("截图间隔", _wrap_slider(self.interval_slider, self.interval_value, "ms"))
         self.font_slider, self.font_value = _slider_row(14, 42, 1)
         form.addRow("字幕字号", _wrap_slider(self.font_slider, self.font_value, "px"))
@@ -327,7 +596,8 @@ class ControlPanel(QWidget):
 
         hint = QLabel(
             "热键  Ctrl+Alt+R 框选  ·  Ctrl+Alt+S 开始/暂停  ·  Ctrl+Alt+H 显示/隐藏字幕\n"
-            "拖动浅色边框可移动识别区，拉边角缩放。字幕条可单独拖动。"
+            "拖动浅色边框可移动识别区，拉边角缩放。字幕条可单独拖动。\n"
+            "绑定程序后识别框会跟随该窗口，并只截该窗口画面；不绑定则仍是屏幕固定区域。"
         )
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
@@ -345,6 +615,7 @@ class ControlPanel(QWidget):
         self.show_original.setChecked(self._config.show_original)
         self.click_through.setChecked(self._config.click_through)
         self._sync_key_fields()
+        self._refresh_bind_label()
 
     def _collect_fields(self) -> None:
         self._config.src_lang = self.src_combo.currentData()
@@ -367,19 +638,24 @@ class ControlPanel(QWidget):
         self.deepl_key_row.setEnabled(deepl)
 
     def _on_select_cancelled(self) -> None:
+        self._restore_panel_after_select()
         if self._region.width() >= 8:
             self.frame.set_region(self._region)
             self.overlay.show()
         self._set_status("已取消框选")
 
     def _on_region_selected(self, rect: QRect) -> None:
+        self._restore_panel_after_select()
         self._set_region(rect, apply_pipeline=False, snap_overlay=True)
         self.frame.set_region(rect)
         self.overlay.show()
+        self._sync_bound_rel_from_region()
         self._set_status("已框选，可拖边框移动、拉边角缩放")
 
     def _on_region_resized(self, rect: QRect) -> None:
         self._set_region(rect, apply_pipeline=self._running, snap_overlay=False)
+        if not self._applying_bind and not self.frame.is_dragging():
+            self._sync_bound_rel_from_region()
         self._set_status(f"识别区域 {rect.width()}×{rect.height()}")
 
     def _set_region(self, rect: QRect, apply_pipeline: bool, snap_overlay: bool = False) -> None:
@@ -392,7 +668,7 @@ class ControlPanel(QWidget):
     def _apply_region_to_pipeline(self) -> None:
         if self._running and self._region.width() >= 8:
             self._collect_fields()
-            self.pipeline.configure(self._region, self._config)
+            self.pipeline.configure(self._region, self._config, self._bound_hwnd)
 
     def _on_result(self, original: str, translated: str, is_error: bool) -> None:
         self.overlay.set_texts(original, translated, is_error)
@@ -409,6 +685,106 @@ class ControlPanel(QWidget):
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
+
+
+class _ComboStyle(QProxyStyle):
+    def drawPrimitive(self, element, option, painter, widget=None) -> None:
+        if element == QStyle.PrimitiveElement.PE_IndicatorArrowDown:
+            return
+        if widget is not None and widget.inherits("QComboBoxPrivateContainer"):
+            if element in (
+                QStyle.PrimitiveElement.PE_Frame,
+                QStyle.PrimitiveElement.PE_Widget,
+                QStyle.PrimitiveElement.PE_FrameWindow,
+                QStyle.PrimitiveElement.PE_PanelMenu,
+            ):
+                return
+        super().drawPrimitive(element, option, painter, widget)
+
+    def styleHint(self, hint, option=None, widget=None, returnData=None):
+        if hint == QStyle.StyleHint.SH_ComboBox_PopupFrameStyle:
+            return int(QFrame.Shape.NoFrame)
+        return super().styleHint(hint, option, widget, returnData)
+
+
+def _style_combo(combo: QComboBox) -> None:
+    fusion = QStyleFactory.create("Fusion")
+    combo.setStyle(_ComboStyle(fusion) if fusion is not None else _ComboStyle())
+    view = QListView()
+    view.setFrameShape(QFrame.Shape.NoFrame)
+    view.setLineWidth(0)
+    view.setSpacing(2)
+    view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    combo.setView(view)
+    combo.setMaxVisibleItems(10)
+    combo.showPopup = lambda c=combo: _show_combo_popup(c)  # type: ignore[method-assign]
+
+
+def _show_combo_popup(combo: QComboBox) -> None:
+    view = combo.view()
+    container = view.parentWidget() if view is not None else None
+    if container is not None:
+        container.setWindowFlags(
+            Qt.WindowType.Popup
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        if isinstance(container, QFrame):
+            container.setFrameShape(QFrame.Shape.NoFrame)
+            container.setLineWidth(0)
+            container.setMidLineWidth(0)
+    QComboBox.showPopup(combo)
+
+
+def _chevron_font_family() -> str:
+    for name in ("Segoe Fluent Icons", "Segoe MDL2 Assets"):
+        if QFontDatabase.hasFamily(name):
+            return name
+    return ""
+
+
+def _chevron_png(color: str, filename: str) -> Path:
+    folder = Path(__file__).resolve().parent / "assets"
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / filename
+    dpr = 2
+    logical = 12
+    size = logical * dpr
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    family = _chevron_font_family()
+    if family:
+        font = QFont(family)
+        font.setPixelSize(size)
+        painter.setFont(font)
+        painter.setPen(QColor(color))
+        painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "\uE70D")
+    else:
+        scale = size / 12
+        pen = QPen(QColor(color), 1.25 * scale)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPolyline(
+            QPolygonF(
+                [
+                    QPointF(2.6 * scale, 4.35 * scale),
+                    QPointF(6.0 * scale, 7.75 * scale),
+                    QPointF(9.4 * scale, 4.35 * scale),
+                ]
+            )
+        )
+    painter.end()
+    pix.save(str(dest), "PNG")
+    return dest
+
+
+def _qss_url(path: Path) -> str:
+    return path.resolve().as_uri()
 
 
 def _secret_input(placeholder: str) -> tuple[QWidget, QLineEdit]:

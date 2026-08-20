@@ -23,6 +23,9 @@ class TrayIcon(QSystemTrayIcon):
         self.activated.connect(self._on_activated)
 
     def _show_panel(self) -> None:
+        if hasattr(self._panel, "show_from_tray"):
+            self._panel.show_from_tray()
+            return
         self._panel.show()
         self._panel.raise_()
         self._panel.activateWindow()

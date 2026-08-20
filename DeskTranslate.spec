@@ -15,6 +15,9 @@ hiddenimports = [
     "pynput.keyboard",
     "pynput.keyboard._win32",
     "pynput.mouse._win32",
+    "app.capture.dpi",
+    "app.capture.window_bind",
+    "app.capture.window_grab",
     "comtypes",
     "PIL",
 ]

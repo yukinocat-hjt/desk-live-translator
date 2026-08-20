@@ -8,6 +8,7 @@ from typing import Any
 
 
 APP_NAME = "DeskTranslate"
+_SESSION_ONLY = frozenset({"bound_exe", "bound_rel"})
 
 
 def config_dir() -> Path:
@@ -26,14 +27,14 @@ class AppConfig:
     src_lang: str = "en"
     dest_lang: str = "zh"
     interval_ms: int = 400
-    debounce_ms: int = 300
+    debounce_ms: int = 180
     font_size: int = 22
     engine: str = "youdao"
     show_original: bool = True
     click_through: bool = True
     ocr_min_score: float = 0.5
     ocr_min_chars: int = 2
-    change_threshold: float = 8.0
+    change_threshold: float = 3.0
     overlay_opacity: float = 0.78
     youdao_app_key: str = ""
     youdao_app_secret: str = ""
@@ -41,6 +42,8 @@ class AppConfig:
     select_hotkey: str = "<ctrl>+<alt>+r"
     toggle_run_hotkey: str = "<ctrl>+<alt>+s"
     toggle_overlay_hotkey: str = "<ctrl>+<alt>+h"
+    bound_exe: str = ""
+    bound_rel: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -52,8 +55,11 @@ class AppConfig:
 
     def save(self) -> None:
         path = config_path()
+        data = self.to_dict()
+        for key in _SESSION_ONLY:
+            data.pop(key, None)
         path.write_text(
-            json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
+            json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -68,6 +74,8 @@ class AppConfig:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return cls()
+            for key in _SESSION_ONLY:
+                data.pop(key, None)
             return cls.from_dict(data)
         except (OSError, json.JSONDecodeError):
             return cls()

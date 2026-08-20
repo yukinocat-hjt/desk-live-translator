@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import os
 import sys
 from pathlib import Path
@@ -8,7 +7,11 @@ from pathlib import Path
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+
+from app.capture.dpi import enable_per_monitor_dpi
 
 from app.config import AppConfig
 from app.hotkeys import HotkeyManager
@@ -19,17 +22,15 @@ from app.ui.tray import TrayIcon
 
 def _enable_dpi_awareness() -> None:
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
+    os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
+    enable_per_monitor_dpi()
 
 
 def main() -> int:
     _enable_dpi_awareness()
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("桌面实时翻译")

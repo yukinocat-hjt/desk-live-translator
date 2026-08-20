@@ -46,6 +46,9 @@ class RegionFrame(QWidget):
     def region(self) -> QRect:
         return QRect(self._region)
 
+    def is_dragging(self) -> bool:
+        return bool(self._mode)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
